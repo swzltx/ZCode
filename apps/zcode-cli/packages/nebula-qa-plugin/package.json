@@ -1,0 +1,8 @@
+{
+  "name": "@zcode/nebula-qa-plugin",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Built-in ZCode plugin: local stdio Nebula QA MCP server + nebula-qa skill.",
+  "license": "MIT",
+  "type": "module"
+}

@@ -141,8 +141,41 @@ export interface CreateMcpAdapterOptions {
   workingDirectory?: string;
   /** 有此端口才向 server 宣告 elicitation 能力；缺省时 server 的 elicitation/create 收到 method not found。 */
   elicitation?: McpElicitationPort;
+  /** 有此端口才向 server 宣告 sampling 能力；宿主用会话当前模型完成 server 发起的采样请求。 */
+  sampling?: McpSamplingPort;
   /** server → client 通知（资源更新 / 列表变化 / 工具列表变化 / 日志）的出口；缺省只记 debug。 */
   notifications?: McpNotificationPort;
+}
+
+/** sampling 内容块（只支持文本/图片；音频与资源引用在宿主侧会被明确拒绝）。 */
+export type McpSamplingBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; data: string };
+
+export interface McpSamplingRequest {
+  serverName: string;
+  messages: Array<{
+    role: "user" | "assistant";
+    content: McpSamplingBlock | McpSamplingBlock[];
+  }>;
+  systemPrompt?: string;
+  maxTokens?: number;
+  temperature?: number;
+  /** 当前工具调用的归属；没有归属时宿主拒绝，不猜会话。 */
+  trace?: McpElicitationTrace;
+}
+
+export interface McpSamplingResult {
+  content: { type: "text"; text: string };
+  model: string;
+  stopReason?: string;
+}
+
+export interface McpSamplingPort {
+  requestSampling(
+    request: McpSamplingRequest,
+    options?: { signal?: AbortSignal },
+  ): Promise<McpSamplingResult>;
 }
 
 type McpClient = Client;
@@ -239,6 +272,25 @@ function isSupportedElicitationMode(mode: unknown): boolean {
   return mode === undefined || (typeof mode === "string" && SUPPORTED_ELICITATION_MODES.has(mode));
 }
 
+/** 把 MCP sampling 内容块收窄成宿主支持的文本/图片；其它类型响亮拒绝。 */
+function mapSamplingContent(content: unknown): McpSamplingBlock[] {
+  const blocks = Array.isArray(content) ? content : [content];
+  return blocks.map((raw) => {
+    const block = (raw ?? {}) as Record<string, unknown>;
+    if (block.type === "text" && typeof block.text === "string") {
+      return { type: "text", text: block.text };
+    }
+    if (
+      block.type === "image" &&
+      typeof block.data === "string" &&
+      typeof block.mimeType === "string"
+    ) {
+      return { type: "image", mimeType: block.mimeType, data: block.data };
+    }
+    throw new Error(`sampling 只支持文本/图片内容，收到：${String(block.type)}`);
+  });
+}
+
 class NodeMcpAdapter implements McpPort {
   private readonly adapterInstanceId = randomUUID();
   private readonly clientName: string;
@@ -276,6 +328,7 @@ class NodeMcpAdapter implements McpPort {
   private readonly records = new Map<string, McpServerRecord>();
   private readonly workingDirectory?: string;
   private readonly elicitation?: McpElicitationPort;
+  private readonly sampling?: McpSamplingPort;
   private readonly notifications?: McpNotificationPort;
   /** 资源订阅登记表 serverName → uri → subscriberKey；唯一 owner，连接层计数。 */
   private readonly resourceSubscriptions = new McpResourceSubscriptionRegistry();
@@ -283,6 +336,11 @@ class NodeMcpAdapter implements McpPort {
   private toolListRevisionCounter = 0;
   /** 每个 server 当前正在执行的工具调用 trace；elicitation 借此归属到会话 / 工具行。 */
   private readonly activeCallTraces = new Map<string, McpElicitationTrace>();
+  /**
+   * 最近一次工具调用的 trace。后台执行的 sampling（如 ui.run 返回后引擎继续跑）没有
+   * 活跃工具调用可归属，用最近一次 trace 在 30 分钟内兜底；超过窗口不猜会话。
+   */
+  private readonly lastCallTraces = new Map<string, { trace: McpElicitationTrace; at: number }>();
 
   constructor(options: CreateMcpAdapterOptions) {
     this.clientName = options.clientName ?? "zcode";
@@ -299,6 +357,7 @@ class NodeMcpAdapter implements McpPort {
     this.telemetry = options.telemetry;
     this.workingDirectory = options.workingDirectory;
     this.elicitation = options.elicitation;
+    this.sampling = options.sampling;
     this.notifications = options.notifications;
   }
 
@@ -1114,6 +1173,79 @@ class NodeMcpAdapter implements McpPort {
     });
   }
 
+  /**
+   * server 主动 sampling/createMessage：用会话当前模型完成一次纯文本补全。
+   *
+   * 只接受文本/图片块；音频、资源引用等宿主没有实现的内容类型直接报错，
+   * 不静默降级成空结果——server 的 ReAct 循环需要知道这次采样没成功。
+   */
+  private installSamplingHandler(client: McpClient, serverName: string): void {
+    const port = this.sampling;
+    const setRequestHandler = (client as unknown as { setRequestHandler?: unknown }).setRequestHandler;
+    if (!port || typeof setRequestHandler !== "function") return;
+    (
+      client as unknown as {
+        setRequestHandler(
+          method: "sampling/createMessage",
+          handler: (
+            request: {
+              params: {
+                messages: Array<{ role: "user" | "assistant"; content: unknown }>;
+                systemPrompt?: string;
+                maxTokens?: number;
+                temperature?: number;
+              };
+            },
+            extra: { signal: AbortSignal },
+          ) => Promise<unknown>,
+        ): void;
+      }
+    ).setRequestHandler("sampling/createMessage", async (request, extra) => {
+      const activeTrace = this.activeCallTraces.get(serverName);
+      const lastTrace = this.lastCallTraces.get(serverName);
+      const trace =
+        activeTrace ??
+        (lastTrace && Date.now() - lastTrace.at <= 30 * 60_000 ? lastTrace.trace : undefined);
+      try {
+        const messages = request.params.messages.map((message) => ({
+          role: message.role,
+          content: mapSamplingContent(message.content),
+        }));
+        const result = await port.requestSampling(
+          {
+            serverName,
+            messages,
+            ...(request.params.systemPrompt !== undefined
+              ? { systemPrompt: request.params.systemPrompt }
+              : {}),
+            ...(typeof request.params.maxTokens === "number"
+              ? { maxTokens: request.params.maxTokens }
+              : {}),
+            ...(typeof request.params.temperature === "number"
+              ? { temperature: request.params.temperature }
+              : {}),
+            ...(trace ? { trace } : {}),
+          },
+          { signal: extra.signal },
+        );
+        return {
+          role: "assistant",
+          content: result.content,
+          model: result.model,
+          ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+        };
+      } catch (error) {
+        this.logger?.warn("MCP sampling failed", {
+          event: "mcp.sampling.failed",
+          mcpServerName: serverName,
+          hasTrace: Boolean(trace),
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+    });
+  }
+
   /** 调用期间登记 trace，server 在这段时间发起的 elicitation 才能归属到会话 / 工具行。 */
   private async callToolOnClient(
     client: McpClient,
@@ -1126,6 +1258,14 @@ class NodeMcpAdapter implements McpPort {
       ...(request.trace?.sessionId ? { sessionId: String(request.trace.sessionId) } : {}),
       ...(request.trace?.turnId ? { turnId: String(request.trace.turnId) } : {}),
       ...(request.trace?.traceId ? { traceId: String(request.trace.traceId) } : {}),
+    });
+    this.lastCallTraces.set(request.serverName, {
+      trace: {
+        ...(request.trace?.sessionId ? { sessionId: String(request.trace.sessionId) } : {}),
+        ...(request.trace?.turnId ? { turnId: String(request.trace.turnId) } : {}),
+        ...(request.trace?.traceId ? { traceId: String(request.trace.traceId) } : {}),
+      },
+      at: Date.now(),
     });
     try {
       return await this.callToolOnClientInner(client, request, timeoutMs, signal, onProgress);
@@ -1541,10 +1681,13 @@ class NodeMcpAdapter implements McpPort {
             ...buildMcpAppsClientCapabilities(),
             // 只宣告 form 模式（url 模式不做）；server 据此选择 elicitation 形态。
             ...(this.elicitation ? { elicitation: { form: {} } } : {}),
+            // server 发起的 sampling：宿主用会话当前模型完成；没有端口时不宣告，server 不会调用。
+            ...(this.sampling ? { sampling: {} } : {}),
           },
         },
       );
       this.installElicitationHandler(client, name);
+      this.installSamplingHandler(client, name);
       this.installNotificationHandlers(client, name);
       this.updateCurrentRecord(name, generation, {
         client,

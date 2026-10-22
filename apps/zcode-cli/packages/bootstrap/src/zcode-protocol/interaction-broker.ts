@@ -20,6 +20,12 @@ import {
   type PermissionBrokerResult,
   type SessionEvent,
 } from "@zcode/contracts";
+import type {
+  McpSamplingBlock,
+  McpSamplingRequest,
+  McpSamplingResult,
+} from "@zcode/adapters/mcp";
+import type { McpAppsSamplingParams } from "@zcode/shared/mcp-apps";
 import {
   MCP_ELICITATION_INTERACTION,
   MCP_ELICITATION_TOOL_NAME,
@@ -241,6 +247,90 @@ function v4AnswerToPermissionResponse(
   // deny/rejectOnce/rejectAlways、未知 optionId、无 optionId 全部落 deny。
   return { decision: "deny", reason: buildPermissionDeniedContent(answer.freeText) };
 }
+
+/**
+ * MCP sampling：server 在执行工具时请求宿主模型补全。
+ *
+ * 归属与 elicitation 同一条规则：只认当前工具调用 trace 里的 sessionId；
+ * 没有归属就报错，不猜会话、不偷偷用默认模型。模型选择完全由会话决定，
+ * server 传来的 modelPreferences 不参与选模（用户要求“走 ZCode 统一的模型”）。
+ */
+export async function requestMcpSampling(
+  context: ZCodeProtocolAgentServerContext,
+  request: McpSamplingRequest,
+  options?: { signal?: AbortSignal },
+): Promise<McpSamplingResult> {
+  const sessionId = request.trace?.sessionId;
+  const record = sessionId ? context.sessions?.get(sessionId) : undefined;
+  if (!sessionId || !record) {
+    throw new Error("sampling 无法归属到正在执行的会话（缺少工具调用 trace），已拒绝");
+  }
+  const params: McpAppsSamplingParams = {
+    messages: request.messages.map((message) => {
+      const blocks = Array.isArray(message.content) ? message.content : [message.content];
+      return {
+        role: message.role,
+        content: blocks.map(toHostSamplingBlock),
+      };
+    }),
+    ...(request.systemPrompt !== undefined ? { systemPrompt: request.systemPrompt } : {}),
+    maxTokens: request.maxTokens ?? 4096,
+  };
+  try {
+    const result = await record.app.sampleModel(
+      {
+        request: params,
+        source: {
+          pluginId: request.serverName,
+          serverName: request.serverName,
+          appIdentity: request.trace?.traceId ?? request.serverName,
+        },
+      },
+      {
+        abortSignal: options?.signal ?? new AbortController().signal,
+        traceContext: record.traceContext,
+      },
+    );
+    return {
+      content: result.content,
+      model: result.model,
+      ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+    };
+  } catch (error) {
+    context.logger?.warn("MCP sampling model call failed", {
+      event: "mcp.sampling.model_failed",
+      serverName: request.serverName,
+      sessionId,
+      hasImages: params.messages.some((message) =>
+        (Array.isArray(message.content) ? message.content : [message.content]).some(
+          (block) => block.type === "image",
+        ),
+      ),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+/**
+ * 把 MCP sampling 的文本/图片块收窄成宿主 schema 允许的形态。
+ * 图片 MIME 只有 png/jpeg/webp 三种；其它类型响亮拒绝，不静默丢块。
+ */
+export function toHostSamplingBlock(
+  block: McpSamplingBlock,
+): { type: "text"; text: string } | { type: "image"; mimeType: "image/png" | "image/jpeg" | "image/webp"; data: string } {
+  if (block.type === "text") return { type: "text", text: block.text };
+  if (!SAMPLING_IMAGE_MIME_TYPES.has(block.mimeType)) {
+    throw new Error(`sampling 图片类型不支持：${block.mimeType}（只支持 png/jpeg/webp）`);
+  }
+  return {
+    type: "image",
+    mimeType: block.mimeType as "image/png" | "image/jpeg" | "image/webp",
+    data: block.data,
+  };
+}
+
+const SAMPLING_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 /**
  * MCP elicitation：server 在工具执行中向用户提问。

@@ -241,6 +241,10 @@ function resolveMcpServerConfig(
         typeof server.cwd === "string"
           ? resolveTemplate(server.cwd, context, { allowSensitive: false })
           : undefined,
+      protocolVersion:
+        server.protocolVersion === "legacy" || server.protocolVersion === "2026-07-28"
+          ? server.protocolVersion
+          : undefined,
       env,
       ...(officialAuth
         ? {

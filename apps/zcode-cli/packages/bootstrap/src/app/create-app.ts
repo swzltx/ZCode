@@ -19,7 +19,9 @@ import { createPopplerPdfDocumentAdapter } from "@zcode/adapters/pdf";
 import { createNodeSessionMailboxAdapter } from "@zcode/adapters/mailbox";
 import { createNodeContextSourceAdapter } from "@zcode/adapters/context";
 import { createNodeSkillAdapter } from "@zcode/adapters/skills";
-import { createMcpAdapter } from "@zcode/adapters/mcp";
+import { createMcpAdapter, type McpSamplingPort } from "@zcode/adapters/mcp";
+import type { McpAppsSamplingParams } from "@zcode/shared/mcp-apps";
+import { toHostSamplingBlock } from "../zcode-protocol/interaction-broker.js";
 import {
   AgentRuntime,
   normalizeAgentProfiles,
@@ -411,6 +413,14 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       startupTimer,
       storageRoot,
     });
+    // MCP server 的 sampling 端口：runtime 在 app 装配后段才就绪，先用延迟绑定占位。
+    let samplingPortImpl: McpSamplingPort | null = null;
+    const samplingPort: McpSamplingPort = {
+      requestSampling: (request, requestOptions) =>
+        samplingPortImpl
+          ? samplingPortImpl.requestSampling(request, requestOptions)
+          : Promise.reject(new Error("宿主采样尚未就绪")),
+    };
     const mcpPort =
       options.mcpPort ??
       (runtimeConfig.mcp?.enabled === false
@@ -420,6 +430,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
             clientVersion: appVersion,
             env: options.env,
             logger,
+            sampling: samplingPort,
             network: {
               httpProxy: configResult.config.network.httpProxy,
               noProxy: configResult.config.network.noProxy,
@@ -471,6 +482,47 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
     const getRuntime = (): AgentRuntime => {
       if (!runtime) throw new Error("ZCode runtime is not initialized yet.");
       return runtime;
+    };
+    samplingPortImpl = {
+      requestSampling: async (request, options) => {
+        try {
+          const params: McpAppsSamplingParams = {
+            messages: request.messages.map((message) => {
+              const blocks = Array.isArray(message.content) ? message.content : [message.content];
+              return { role: message.role, content: blocks.map(toHostSamplingBlock) };
+            }),
+            ...(request.systemPrompt !== undefined ? { systemPrompt: request.systemPrompt } : {}),
+            maxTokens: request.maxTokens ?? 4096,
+          };
+          const result = await getRuntime().sampleModel(
+            {
+              request: params,
+              source: {
+                pluginId: request.serverName,
+                serverName: request.serverName,
+                appIdentity: request.trace?.traceId ?? request.serverName,
+              },
+            },
+            {
+              abortSignal: options?.signal ?? new AbortController().signal,
+              traceContext,
+            },
+          );
+          return {
+            content: result.content,
+            model: result.model,
+            ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+          };
+        } catch (error) {
+          logger?.warn("MCP sampling failed", {
+            event: "mcp.sampling.failed",
+            serverName: request.serverName,
+            hasTrace: Boolean(request.trace?.sessionId),
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
+      },
     };
     let resumePrepared = false;
     const resolveDefaultShellSelection = (): ExecutionShellSelection =>

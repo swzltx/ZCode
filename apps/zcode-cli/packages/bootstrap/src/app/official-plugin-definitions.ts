@@ -267,6 +267,33 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
     version: "0.1.1",
   },
   {
+    // 默认关闭：由插件自带 stdio MCP 服务，用户只需启用并（可选）填视觉模型 Key。
+    // 服务从插件目录启动，不监听端口、不需要令牌。
+    listing: {
+      author: { name: "Nebula" },
+      category: "developer-tools",
+      displayName: "Nebula QA",
+      displayName_i18n: { "zh-CN": "Nebula 测试" },
+      description_i18n: {
+        "zh-CN": "内置 Nebula QA 引擎：用例设计、UI/API 执行、分诊与执行证据读取。",
+      },
+    },
+    name: "nebula-qa",
+    requiredSeedPaths: [
+      "dist/mcp/main.js",
+      "skills/nebula-qa/SKILL.md",
+      "skills/nebula-qa/references/tools.md",
+    ],
+    rootCandidates: [
+      "packages/nebula-qa-plugin",
+      "../nebula-qa-plugin",
+      "../../nebula-qa-plugin",
+      "../../../nebula-qa-plugin",
+    ],
+    runtimeTopLevelPaths: ["node_modules"],
+    version: "0.3.0",
+  },
+  {
     listing: {
       author: ZAI_AUTHOR,
       category: "developer-tools",

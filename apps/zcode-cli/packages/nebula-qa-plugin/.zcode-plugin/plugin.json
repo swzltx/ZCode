@@ -1,0 +1,24 @@
+{
+  "name": "nebula-qa",
+  "version": "0.3.0",
+  "description": "Ships the Nebula QA engine as a local stdio MCP server plus the nebula-qa testing skill. UI execution uses the host session model via MCP sampling.",
+  "author": {
+    "name": "Nebula"
+  },
+  "license": "MIT",
+  "skills": "skills",
+  "mcpServers": {
+    "nebula": {
+      "type": "stdio",
+      "command": "node",
+      "protocolVersion": "legacy",
+      "args": ["${ZCODE_PLUGIN_ROOT}/dist/mcp/main.js"],
+      "env": {
+        "NEBULA_DATA_DIR": "${ZCODE_PLUGIN_DATA}",
+        "NEBULA_WORKSPACE": "${ZCODE_PROJECT_DIR}"
+      },
+      "timeoutMs": 120000,
+      "alwaysLoad": true
+    }
+  }
+}
