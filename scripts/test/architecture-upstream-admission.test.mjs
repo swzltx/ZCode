@@ -18,7 +18,9 @@ async function git(cwd, ...args) {
 async function fixture(run) {
   const cwd = await mkdtemp(join(tmpdir(), "architecture-upstream-"));
   try {
-    await git(cwd, "init", "-b", "main");
+    // git init -b 需要 Git >= 2.28；init + symbolic-ref 兼容旧版 Git。
+    await git(cwd, "init");
+    await git(cwd, "symbolic-ref", "HEAD", "refs/heads/main");
     await git(cwd, "config", "user.name", "Architecture Test");
     await git(cwd, "config", "user.email", "architecture@example.invalid");
     await git(cwd, "config", "commit.gpgsign", "false");
@@ -120,7 +122,7 @@ test("未提交的当前合并可先校验，修改上游文件仍不能接纳",
     assert.deepEqual(await collect(), []);
     await writeFile(join(cwd, file), "export const value = 2;\n");
     assert.deepEqual(await collect(), [file]);
-    await git(cwd, "restore", file);
+    await git(cwd, "checkout", "--", file);
     await git(cwd, "merge", "--abort");
     await assert.rejects(collect(), /ancestor|祖先|合入/);
   });

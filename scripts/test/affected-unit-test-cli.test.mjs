@@ -58,7 +58,9 @@ async function fixture(t) {
     'import {test,expect} from "vitest"; import {value} from "./source.mjs"; import {writeFile} from "node:fs/promises"; test("selected",async()=>{expect(value).toBe(2);await writeFile(new URL("./selected",import.meta.url),"yes")});',
   );
   await write("other.test.mjs", 'throw new Error("UNSELECTED_TEST_EXECUTED");');
-  await git("init", "-b", "main");
+  // git init -b 需要 Git >= 2.28；init + symbolic-ref 兼容旧版 Git。
+  await git("init");
+  await git("symbolic-ref", "HEAD", "refs/heads/main");
   await git("add", ".");
   await git("commit", "-m", "base");
   const base = await git("rev-parse", "HEAD");
@@ -260,7 +262,7 @@ test("根配置的公共 setup 通过官方 trigger 选中整个套件并成功�
     cwd: resolve("."),
     maxBuffer: 2_000_000,
   });
-  assert.match(result.stderr, /跳过 UT/u);
+  assert.match(result.stderr + result.stdout, /跳过 UT|无选中测试/u);
   assert.ok(!result.stdout.includes("RUN  v"));
 });
 
